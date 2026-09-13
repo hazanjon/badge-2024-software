@@ -192,15 +192,26 @@ static esp_err_t mirror_tx_blob(spi_device_handle_t spi, const uint8_t *src, siz
 // ----------------------------------------------------------------------------
 
 static void mirror_sink_send_frame(const void *fb_data, size_t len, void *user_data) {
+    ESP_LOGE(TAG, "DIAG: mirror_sink_send_frame ENTERED");
     mirror_port_state_t *mp = (mirror_port_state_t *)user_data;
     if (mp == NULL || !mp->active || mp->spi == NULL || fb_data == NULL || len == 0) {
+        ESP_LOGE(TAG, "DIAG: mirror_sink_send_frame early-return (guard check failed)");
         return;
     }
 
+    // NOTE (2026-09-13): spi_device_acquire_bus() in this ESP-IDF version
+    // (v5.5.1) hard-rejects any wait value other than portMAX_DELAY with
+    // ESP_ERR_INVALID_ARG (see SPI_CHECK at the top of the function in
+    // esp_driver_spi/src/gpspi/spi_master.c). A prior session's attempt to
+    // bound this wait with a 1s timeout was silently failing every single
+    // frame send with that error -- not the hang it was meant to diagnose.
+    ESP_LOGE(TAG, "mirror_sink_send_frame: acquiring bus (port %d)...", mp->port);
     esp_err_t bret = spi_device_acquire_bus(mp->spi, portMAX_DELAY);
     if (bret != ESP_OK) {
+        ESP_LOGE(TAG, "mirror_sink_send_frame: spi_device_acquire_bus failed/timed out: %s", esp_err_to_name(bret));
         return;
     }
+    ESP_LOGE(TAG, "mirror_sink_send_frame: bus acquired");
 
     // 1. Manually assert CS LOW
     if (mp->cs_pin >= 0) {
@@ -217,6 +228,7 @@ static void mirror_sink_send_frame(const void *fb_data, size_t len, void *user_d
 
     // 3. Transmit magic header if configured (e.g. "TDHD" for HDMI)
     if (mp->driver.header != NULL && mp->driver.header_len > 0) {
+        ESP_LOGE(TAG, "mirror_sink_send_frame: sending %d-byte header...", (int)mp->driver.header_len);
         spi_transaction_t tx_hdr;
         memset(&tx_hdr, 0, sizeof(tx_hdr));
         tx_hdr.length = mp->driver.header_len * 8;
@@ -229,10 +241,13 @@ static void mirror_sink_send_frame(const void *fb_data, size_t len, void *user_d
                 had_hdr_err = true;
             }
         }
+        ESP_LOGE(TAG, "mirror_sink_send_frame: header sent");
     }
 
     // 4. Transmit pixel payload via SPI DMA while holding CS LOW
+    ESP_LOGE(TAG, "mirror_sink_send_frame: sending %d-byte payload...", (int)len);
     esp_err_t tret = mirror_tx_blob(mp->spi, (const uint8_t *)fb_data, len);
+    ESP_LOGE(TAG, "mirror_sink_send_frame: payload send returned");
     if (tret != ESP_OK) {
         static bool had_frame_err = false;
         if (!had_frame_err) {
@@ -391,6 +406,7 @@ void flow3r_bsp_display_spi_release(spi_device_handle_t handle) {
 }
 
 esp_err_t flow3r_bsp_display_mirror_attach(int port, int sck, int mosi, int cs, int dc, int baudrate, const flow3r_bsp_display_driver_t *driver) {
+    ESP_LOGE(TAG, "DIAG: flow3r_bsp_display_mirror_attach ENTERED, port=%d", port);
     flow3r_bsp_display_init();
     if (port < 1 || port > 6) {
         ESP_LOGE(TAG, "Invalid hexpansion port %d (must be 1..6)", port);
@@ -463,7 +479,7 @@ esp_err_t flow3r_bsp_display_mirror_attach(int port, int sck, int mosi, int cs, 
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Display mirror attached on port %d [SCK=%d, MOSI=%d, CS=%d, DC=%d] (sink handle: %d).",
+    ESP_LOGE(TAG, "Display mirror attached on port %d [SCK=%d, MOSI=%d, CS=%d, DC=%d] (sink handle: %d).",
              port, sck, mosi, cs, dc, mp->sink_handle);
     return ESP_OK;
 
