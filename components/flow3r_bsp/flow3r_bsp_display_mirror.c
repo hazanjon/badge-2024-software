@@ -11,6 +11,19 @@
 
 static const char *TAG = "bsp-display-mirror";
 
+// Use a dedicated host, NOT the one the main gc9a01 screen driver permanently
+// owns with its own fixed pins (flow3r_bsp_display.c's gc9a01_config.host,
+// which is the numeric literal 2 -- i.e. SPI3_HOST, since spi_host_device_t is
+// zero-indexed: SPI1_HOST=0, SPI2_HOST=1, SPI3_HOST=2. NOT SPI2_HOST, despite
+// the "2" in its name -- an earlier fix here mistook that literal for
+// SPI2_HOST and pointed the mirror at SPI3_HOST too, which collided directly
+// with the main screen instead of avoiding it).
+// spi_bus_initialize() binds one fixed pin set per host for its lifetime, so
+// sharing a host between the main screen and a hexpansion mirror (different
+// pins) causes whichever one initializes second to fail its own
+// spi_bus_add_device()/spi_bus_initialize() call. SPI2_HOST is the one
+// GP-SPI peripheral left unused (SPI1_HOST is permanently reserved for
+// flash/PSRAM), giving the mirror a fully independent peripheral.
 #define MIRROR_SPI_HOST         SPI2_HOST
 #define MIRROR_MAX_XFER         (115200 + 128)
 #define MIRROR_CHUNK_BYTES      4096
@@ -192,10 +205,8 @@ static esp_err_t mirror_tx_blob(spi_device_handle_t spi, const uint8_t *src, siz
 // ----------------------------------------------------------------------------
 
 static void mirror_sink_send_frame(const void *fb_data, size_t len, void *user_data) {
-    ESP_LOGE(TAG, "DIAG: mirror_sink_send_frame ENTERED");
     mirror_port_state_t *mp = (mirror_port_state_t *)user_data;
     if (mp == NULL || !mp->active || mp->spi == NULL || fb_data == NULL || len == 0) {
-        ESP_LOGE(TAG, "DIAG: mirror_sink_send_frame early-return (guard check failed)");
         return;
     }
 
@@ -205,13 +216,15 @@ static void mirror_sink_send_frame(const void *fb_data, size_t len, void *user_d
     // esp_driver_spi/src/gpspi/spi_master.c). A prior session's attempt to
     // bound this wait with a 1s timeout was silently failing every single
     // frame send with that error -- not the hang it was meant to diagnose.
-    ESP_LOGE(TAG, "mirror_sink_send_frame: acquiring bus (port %d)...", mp->port);
     esp_err_t bret = spi_device_acquire_bus(mp->spi, portMAX_DELAY);
     if (bret != ESP_OK) {
-        ESP_LOGE(TAG, "mirror_sink_send_frame: spi_device_acquire_bus failed/timed out: %s", esp_err_to_name(bret));
+        static bool had_acquire_err = false;
+        if (!had_acquire_err) {
+            ESP_LOGE(TAG, "mirror_sink_send_frame: spi_device_acquire_bus failed/timed out: %s", esp_err_to_name(bret));
+            had_acquire_err = true;
+        }
         return;
     }
-    ESP_LOGE(TAG, "mirror_sink_send_frame: bus acquired");
 
     // 1. Manually assert CS LOW
     if (mp->cs_pin >= 0) {
@@ -228,7 +241,6 @@ static void mirror_sink_send_frame(const void *fb_data, size_t len, void *user_d
 
     // 3. Transmit magic header if configured (e.g. "TDHD" for HDMI)
     if (mp->driver.header != NULL && mp->driver.header_len > 0) {
-        ESP_LOGE(TAG, "mirror_sink_send_frame: sending %d-byte header...", (int)mp->driver.header_len);
         spi_transaction_t tx_hdr;
         memset(&tx_hdr, 0, sizeof(tx_hdr));
         tx_hdr.length = mp->driver.header_len * 8;
@@ -241,13 +253,10 @@ static void mirror_sink_send_frame(const void *fb_data, size_t len, void *user_d
                 had_hdr_err = true;
             }
         }
-        ESP_LOGE(TAG, "mirror_sink_send_frame: header sent");
     }
 
     // 4. Transmit pixel payload via SPI DMA while holding CS LOW
-    ESP_LOGE(TAG, "mirror_sink_send_frame: sending %d-byte payload...", (int)len);
     esp_err_t tret = mirror_tx_blob(mp->spi, (const uint8_t *)fb_data, len);
-    ESP_LOGE(TAG, "mirror_sink_send_frame: payload send returned");
     if (tret != ESP_OK) {
         static bool had_frame_err = false;
         if (!had_frame_err) {
@@ -406,7 +415,6 @@ void flow3r_bsp_display_spi_release(spi_device_handle_t handle) {
 }
 
 esp_err_t flow3r_bsp_display_mirror_attach(int port, int sck, int mosi, int cs, int dc, int baudrate, const flow3r_bsp_display_driver_t *driver) {
-    ESP_LOGE(TAG, "DIAG: flow3r_bsp_display_mirror_attach ENTERED, port=%d", port);
     flow3r_bsp_display_init();
     if (port < 1 || port > 6) {
         ESP_LOGE(TAG, "Invalid hexpansion port %d (must be 1..6)", port);
@@ -434,15 +442,21 @@ esp_err_t flow3r_bsp_display_mirror_attach(int port, int sck, int mosi, int cs, 
         return ret;
     }
 
-    ret = mirror_init_pins(sck, mosi, cs, dc);
+    // Acquire the SPI bus/device before touching CS/DC GPIO state: this is
+    // the step most likely to fail (host already claimed by another SPI
+    // user, e.g. this same hexpansion's own onboard driver). If we
+    // reconfigured CS/DC first and then failed here, we'd have already
+    // stolen those pins out from under whatever driver is currently using
+    // them, breaking it even though our own attach never succeeded.
+    spi_device_handle_t spi = NULL;
+    ret = flow3r_bsp_display_spi_acquire_pins(port, sck, mosi, baudrate, &spi);
     if (ret != ESP_OK) {
         goto fail_claim;
     }
 
-    spi_device_handle_t spi = NULL;
-    ret = flow3r_bsp_display_spi_acquire_pins(port, sck, mosi, baudrate, &spi);
+    ret = mirror_init_pins(sck, mosi, cs, dc);
     if (ret != ESP_OK) {
-        goto fail_pins;
+        goto fail_spi;
     }
 
     mirror_port_state_t *mp = &mirror_ports[port];
@@ -479,13 +493,14 @@ esp_err_t flow3r_bsp_display_mirror_attach(int port, int sck, int mosi, int cs, 
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGE(TAG, "Display mirror attached on port %d [SCK=%d, MOSI=%d, CS=%d, DC=%d] (sink handle: %d).",
+    ESP_LOGI(TAG, "Display mirror attached on port %d [SCK=%d, MOSI=%d, CS=%d, DC=%d] (sink handle: %d).",
              port, sck, mosi, cs, dc, mp->sink_handle);
     return ESP_OK;
 
-fail_pins:
+fail_spi:
     if (cs >= 0) gpio_reset_pin(cs);
     if (dc >= 0) gpio_reset_pin(dc);
+    flow3r_bsp_display_spi_release(spi);
 fail_claim:
     flow3r_bsp_display_port_release(port);
     return ret;
